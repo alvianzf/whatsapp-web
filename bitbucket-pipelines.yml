@@ -1,0 +1,61 @@
+definitions:
+  steps:
+    - step: &test
+        name: Test
+        script:
+          - echo 'No test.'
+    - step: &build-and-push
+        name: Build & Push
+        services:
+          - docker
+        script:
+          - docker build -t $APP_NAME:$BITBUCKET_COMMIT --platform=linux/amd64 --target=deployment .
+          - docker tag $APP_NAME:$BITBUCKET_COMMIT $APP_NAME:$REGISTRY_IMAGE_TAG
+          - pipe: atlassian/aws-ecr-push-image:2.1.0
+            variables:
+              AWS_ACCESS_KEY_ID: $AWS_ECR_ACCESS_KEY_ID 
+              AWS_SECRET_ACCESS_KEY: $AWS_ECR_SECRET_ACCESS_KEY
+              AWS_DEFAULT_REGION: $AWS_ECR_DEFAULT_REGION
+              IMAGE_NAME: $APP_NAME
+              TAGS: $REGISTRY_IMAGE_TAG $BITBUCKET_COMMIT
+          - >
+            sh -c "curl -k -X POST -H 'Content-Type: application/json' --data '{\"text\":\"BUILD(*$BITBUCKET_BRANCH*): *$APPLICATION_NAME* image has been build as $REGISTRY_IMAGE:$BITBUCKET_COMMIT.\",\"username\":\"$APPLICATION_NAME\",\"type\":\"mrkdwn\"}' $SLACK_WEBHOOK_URL"
+    - step: &deploy
+        name: Deploy
+        image: atlassian/pipelines-kubectl:latest
+        script:
+          - apk update
+          - apk add --no-cache aws-cli curl
+          - curl -L "https://dl.k8s.io/release/v1.23.6/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+          - chmod +x /usr/local/bin/kubectl
+          - aws eks update-kubeconfig --name $K8S_CLUSTER --region $AWS_DEFAULT_REGION
+          - kubectl set image deploy/$K8S_DEPLOY "$K8S_CONTAINER"="$REGISTRY_IMAGE:$BITBUCKET_COMMIT" -n "$K8S_NAMESPACE"
+          - kubectl rollout status deploy/$K8S_DEPLOY -n "$K8S_NAMESPACE"
+          - >
+            sh -c "curl -k -X POST -H 'Content-Type: application/json' --data '{\"text\":\"DEPLOY(*$BITBUCKET_BRANCH*): *$APPLICATION_NAME* has been deployed to *$BITBUCKET_DEPLOYMENT_ENVIRONMENT* from *$BITBUCKET_COMMIT*.\",\"username\":\"$APPLICATION_NAME\",\"type\":\"mrkdwn\"}' $SLACK_WEBHOOK_URL"
+  stages:
+    - stage: &build-and-deploy
+        name: Build & Deploy
+        steps:
+          - step: *build-and-push
+          - step: *deploy
+pipelines:
+  custom:
+    deploy-to-v25:
+      - stage:
+          <<: *build-and-deploy
+          deployment: v25
+  branches:
+    master:
+      - step: *test
+      - stage:
+          <<: *build-and-deploy
+          trigger: manual
+          deployment: production
+  pull-requests:
+    '**':
+      - step: *test
+      - stage:
+          <<: *build-and-deploy
+          trigger: manual
+          deployment: staging
